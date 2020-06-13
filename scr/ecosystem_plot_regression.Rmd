@@ -1,0 +1,346 @@
+---
+title: "LEAM landuse analysis"
+author: "Cong Cong"
+date: "6/8/2020"
+output:
+  github_document: default
+---
+
+This script will perform a raster-based land use analysis on Stockholm data that includes:  
+- Calculate ecosystem service accessibility values.  
+- Characterize a relationship between residential/commercial land use and ecosystem service accessibility.  
+- Predict future residential/commercial land use based on four spatial drivers.
+
+```{r setup, include=FALSE, message = FALSE, warning = FALSE}
+#Setting root directory
+knitr::opts_knit$set(echo = TRUE,
+                     root.dir = rprojroot::find_rstudio_root_file())
+# Housekeeping 
+for (pkg in c("dplyr", "raster", "rgdal", "xgboost","ggplot2", "RColorBrewer")) {
+  library(pkg, character.only = TRUE)
+}
+rm(list = "pkg")
+#Controlling figure output in markdown
+knitr::opts_chunk$set(
+  out.width = '60%',
+  fig.align="center",
+  cache = FALSE
+)
+# Set default theme for ggplot2
+theme_set(theme_classic() + theme(plot.title = element_text(hjust = 0.5), legend.position = "bottom"))
+# Set Scientific notation output for knitr
+options(scipen = 9999)
+```
+
+```{r functions, message = FALSE, warning = FALSE}
+# This function normalizes raster values to 0-1
+normalize <- function(source){
+  v <- getValues(source)
+  vmin <- min(v, na.rm = TRUE)
+  vmax <- max(v, na.rm = TRUE)
+  n <- v
+  for (i in 1:length(v)){
+    n[i] <- ifelse(is.na(v[i]), v[i], (v[i] - vmin)/(vmax - vmin))
+  }
+  result <- raster(matrix(n, ncol = source@ncols, byrow = TRUE))
+  extent(result) <- extent(source)
+  crs(result) <- crs(source)
+  return(result)
+}
+
+# This function sets up empty cells according to the default map
+set_null_in_raster <- function(target, source){
+  t <- getValues(target)
+  s <- getValues(source)
+  t[which(s %in% c(NA))] = NA
+  result <- raster(matrix(t, ncol = source@ncols, byrow = TRUE))
+  extent(result) <- extent(source)
+  crs(result) <- crs(source)
+  return(result)
+}
+```
+
+# Establish relations  
+This section explores how ecosystem service accessibility influences existing residential land use.  
+
+## Dependent variables: residential and commercial land use as matrices   
+```{r, message = FALSE, warning = FALSE}
+# Read in land use raster
+landuse <- raster("./data/landuse.tif")
+# Extract residential cells (values 21 and 22)
+land_res <- reclassify(landuse, matrix(
+  c(0, 20, 0,
+    20, 22, 21,
+    22, Inf, 0),
+  ncol = 3,
+  byrow = TRUE
+))
+# Extract commercial cells (value 23)
+land_com <- reclassify(landuse, matrix(
+  c(0, 22, 0,
+    22, 23, 23,
+    23, Inf, 0),
+  ncol = 3,
+  byrow = TRUE
+))
+```
+
+## Indenpendent variable: accessibility to ecosystem services
+
+```{r, message = FALSE, warning = FALSE}
+# Accessibility to ecosystem services
+# We assume accessibility is positively related to the density of road network, so here we will varitate ecosystem service values by their distances to roads.
+
+# Read in the road density raster and make sure the new map has the same processing extent and coordinates with the default map
+rd <- raster("./data/road_density.tif")
+rd <- resample(rd, landuse, resample='bilinear')
+
+# You can also create the road density raster from the roadway shapefile using density.psp(). This function performs ROAD NETWORK KDE. The numerical value (800 in the example below) is the Bandwidth:
+# road <- readOGR(dsn= "./input", layer= "road")
+# road$OBJECTID <- road$SPEED
+# rd.psp <- as(road, "psp")  
+# wt <- as.numeric(levels(marks(rd.psp)))[marks(rd.psp)]
+# rd.kde <- density.psp(rd.psp, weight = wt, sigma = 800) 
+# rd <- raster(rd.kde)
+# rd <- resample(rd, landuse, resample='bilinear')
+
+# Read in and process ecosystem service raster
+es <- raster("./data/Stc_ES.tif")
+es <- resample(es,landuse,resample='bilinear')
+
+# Interact ecosystem service values with the road density
+es_by_road <- overlay(es, rd, fun=function(x,y){return(x*y)})
+es_by_road <- set_null_in_raster(es_by_road, landuse)
+```
+
+## Set up the dataframe  
+This example examines the relationship between Residential land use and Ecosystem service accessibility:  
+
+```{r, message = FALSE, warning = FALSE}
+# Normalize both dependent and independent variables (rasters)
+land_res_nor <- normalize(land_res)
+es_by_road <- normalize(es_by_road)
+
+# Put them in one dataframe
+data <- cbind.data.frame(getValues(land_res_nor), getValues(es_by_road))
+data <- na.omit(data)
+colnames(data) <- c("residential", "ecoservice")
+
+# In order to observe the trend, we reduce the dataset to only 300 numbers by sorting and grouping the independent variables, and average the dependent variables within each groups.
+data <- data[order(data$ecoservice),]
+
+# Divide it into 300 intervals, each having n1 records
+n <- nrow(data)
+n1 <- n %/% 300
+id <- rep(1:300, each = n1)
+id <- c(id, rep(300, times = n - 300 * n1))
+data <- cbind(id, data)
+
+# Create a new dataframe for the subsequent analysis
+df <- data %>% group_by(id) %>% summarise(mean(residential), mean(ecoservice))
+colnames(df) <- c("id", "residential", "ecoservice")
+
+# For simplicity, regroup the areas where ecosystem service value is zero
+group0 <- df[df$ecoservice == 0,] 
+group0$id <- 1
+group0 <- group0 %>% group_by(id) %>% summarise(mean(residential), mean(ecoservice))
+colnames(group0) <- c("id", "residential", "ecoservice")
+
+# Finalize the dataframe
+df <- rbind(group0, df[df$ecoservice > 0,] )
+```
+
+## Fit a Model  
+Here the approach is to fit a line, a second-degree polynomial function, and sometimes a third-degree polynomial function to the dataset. Then produce the visualization and compare the fitness of these models by AIC.  
+
+### Fit a line  
+```{r, message = FALSE, warning = FALSE}
+model1 <- lm(residential ~ ecoservice, data = df)
+a1 = model1$coef["(Intercept)"]
+b1 = model1$coef["ecoservice"]
+fun1 <- function (x) {
+  +     eval(parse(text = paste0(a1, " + ", b1 , " * x ", sep = ""))) }
+
+AIC(model1)
+
+ggplot(data = df, aes(x = ecoservice, y = residential)) +
+  geom_jitter(width = 0.02, color = "red") +
+  labs(x = "Normalized ecoservice values", y = "Probability of residential use") +
+  scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, by = 0.1)) +
+  scale_y_continuous(limits = c(0, 0.2), breaks = seq(0, 0.2, by = 0.05)) +
+  theme_bw() + ggtitle("Probability of residential cells vs ecoservice accessibility") +
+  stat_function(data = df, aes(x = ecoservice, y = residential),fun = fun1, linetype = "longdash", color = "red") 
+```
+
+### Fit a second-degree polynomial function  
+```{r, message = FALSE, warning = FALSE}
+df$ecoservice2 <- df$ecoservice ^ 2
+model2 <- lm(residential ~ ecoservice + ecoservice2, data = df)
+
+a2 = model2$coef["(Intercept)"]
+b2 = model2$coef["ecoservice"]
+c2 = model2$coef["ecoservice2"]
+fun2 <- function (x) {
+  +     eval(parse(text = paste0(a2, " + ", b2 , " * x ", "+", c2, " *x**2", sep = ""))) }
+
+AIC(model2)
+
+ggplot(data = df, aes(x = ecoservice, y = residential)) +
+  geom_jitter(width = 0.02, color = "red") +
+  labs(x = "Normalized ecoservice values", y = "Probability of residential use") +
+  scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, by = 0.1)) +
+  scale_y_continuous(limits = c(0, 0.2), breaks = seq(0, 0.2, by = 0.05)) +
+  theme_bw() + ggtitle("Probability of residential cells vs ecoservice accessibility") +
+  stat_function(data = df, aes(x = ecoservice, y = residential),fun = fun2, linetype = "longdash", color = "red") 
+```
+
+### Fit a third-degree polynomial function  
+```{r, message = FALSE, warning = FALSE}
+df$ecoservice3 <- df$ecoservice ^ 3
+model3 <- lm(residential ~ ecoservice + ecoservice2 + ecoservice3, data = df)
+
+a3 = model3$coef["(Intercept)"]
+b3 = model3$coef["ecoservice"]
+c3 = model3$coef["ecoservice2"]
+d3 = model3$coef["ecoservice3"]
+fun3 <- function (x) {
+  +     eval(parse(text = paste0(a3, " + ", b3 , " * x ", "+", c3, " *x**2","+", d3, " *x**3", sep = ""))) }
+
+AIC(model3)
+
+ggplot(data = df, aes(x = ecoservice, y = residential)) +
+  geom_jitter(width = 0.02, color = "red") +
+  labs(x = "Normalized ecoservice values", y = "Probability of residential use") +
+  scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, by = 0.1)) +
+  scale_y_continuous(limits = c(0, 0.2), breaks = seq(0, 0.2, by = 0.05)) +
+  theme_bw() + ggtitle("Probability of residential cells vs ecoservice accessibility") +
+  stat_function(data = df, aes(x = ecoservice, y = residential),fun = fun3, linetype = "longdash", color = "red") 
+
+```
+
+Model3 fits better. But for interpretation it's the researcher's decision to choose the visual that best conveys the relationship between residential land use and ecosystem service accessibility.
+
+Use the same approach to characterize the relationship between commercial land use and ecosystem service accessibility.  
+
+```{r, message = FALSE, warning = FALSE}
+# Normalize both dependent and independent variables (rasters)
+land_com_nor <- normalize(land_com)
+
+# Put them in one dataframe
+data <- cbind.data.frame(getValues(land_com_nor), getValues(es_by_road))
+data <- na.omit(data)
+colnames(data) <- c("commercial", "ecoservice")
+
+# In order to observe the trend, we reduce the dataset to only 300 numbers by sorting and grouping the independent variables, and average the dependent variables within each groups.
+data <- data[order(data$ecoservice),]
+
+# Divide it into 300 intervals, each having n1 records
+n <- nrow(data)
+n1 <- n %/% 300
+id <- rep(1:300, each = n1)
+id <- c(id, rep(300, times = n - 300 * n1))
+data <- cbind(id, data)
+
+# Create a new dataframe for the subsequent analysis
+df <- data %>% group_by(id) %>% summarise(mean(commercial), mean(ecoservice))
+colnames(df) <- c("id", "commercial", "ecoservice")
+
+# For simplicity, regroup the areas where ecosystem service value is zero
+group0 <- df[df$ecoservice == 0,] 
+group0$id <- 1
+group0 <- group0 %>% group_by(id) %>% summarise(mean(commercial), mean(ecoservice))
+colnames(group0) <- c("id", "commercial", "ecoservice")
+
+# Finalize the dataframe
+df <- rbind(group0, df[df$ecoservice > 0,] )
+
+# Set up the model
+model1 <- lm(commercial ~ ecoservice, data = df)
+a1 = model1$coef["(Intercept)"]
+b1 = model1$coef["ecoservice"]
+fun1 <- function (x) {
+  +     eval(parse(text = paste0(a1, " + ", b1 , " * x ", sep = ""))) }
+
+AIC(model1)
+
+ggplot(data = df, aes(x = ecoservice, y = commercial)) +
+  geom_jitter(width = 0.02, color = "red") +
+  labs(x = "Normalized ecoservice values", y = "Probability of commercial use") +
+  scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, by = 0.1)) +
+  scale_y_continuous(limits = c(0, 0.1), breaks = seq(0, 0.1, by = 0.05)) +
+  theme_bw() + ggtitle("Probability of commercial cells vs ecoservice accessibility") +
+  stat_function(data = df, aes(x = ecoservice, y = commercial),fun = fun1, linetype = "longdash", color = "red") 
+
+```
+
+# Predict future land use  
+We assume four factors: the spatial distribution population centers and employment centers, as well as the accessibility to transportation facilities and ecosystem services influence future residential and commercial development. We depict the influence of these factors as attraction maps, which were created based on a gravity-like measure that consider both the attractiveness of the factors (magnitude of population, number of employment, roadway speed, and ecosystem service values) and the travel time to these destinations from each cell. In this section we test two machine learning approaches using the four independent variables to predict the probability of future residential/commercial land use development. 
+
+```{r, message = FALSE, warning = FALSE}
+rm(list=ls()[! ls() %in% c("landuse","es_by_road", "land_res_nor", "land_com_nor", "set_null_in_raster","normalize")])
+
+# Read in and process population, employment and transportation attraction maps
+pop <- raster("./data/pop_att.tif") 
+pop <- resample(pop,landuse,resample='bilinear')
+pop <- set_null_in_raster(pop, landuse) 
+pop <- normalize(pop)
+
+emp <- raster("./data/emp_att.tif")
+emp <- resample(emp,landuse,resample='bilinear')
+emp <- set_null_in_raster(emp, landuse) 
+emp <- normalize(emp)
+
+trans <- raster("./data/transport_att.tif")
+trans <- resample(trans,landuse,resample='bilinear')
+trans <- set_null_in_raster(trans, landuse) 
+trans <- normalize(trans)
+
+# Set up the dataframe
+data <- cbind.data.frame(getValues(land_res_nor), getValues(land_com_nor), getValues(es_by_road),
+                         getValues(pop), getValues(emp), getValues(trans))
+colnames(data) <- c("residential", "commercial", "ecoservice", "population","employment","transportation")
+rm(pop, emp, trans, land_com, land_res, land_com_nor, land_res_nor)
+```
+
+## Logistic regression  
+
+```{r, message = FALSE, warning = FALSE}
+df <- data %>% na.omit()
+logmodel <- glm(commercial ~  ecoservice + population + employment + transportation, data = df)
+
+# Predict
+variables <- data[,c(3, 4, 5, 6)]
+pred <- predict(logmodel, variables)
+pred <- exp(pred)/(1+exp(pred))
+result <- raster(matrix(pred, ncol = landuse@ncols, byrow = TRUE))
+
+# Plot the result
+plot(result, main = "Probability of commercial development", 
+     col = rev(brewer.pal(n = 7, name = "RdBu")))
+```
+
+## Gradient boosting  
+
+```{r, message = FALSE, warning = FALSE}
+rm(df, logmodel, result, variables)
+df <- data %>%na.omit()
+
+# Use a sample of the dataset as training data (or it will be too big for the algorithm to run)
+df2 <- df[runif(nrow(df)/4, 1, nrow(df)),]
+train <- list()
+train$data <- as.matrix(df2[,c(3,4,5,6)])
+train$lable <- df2$residential
+xgmodel <- xgboost(data = train$data, label = train$lable,
+                   max.depth = 2, eta = 1, nthread = 2, nrounds = 2, objective = "binary:logistic")
+
+# Predict
+test = list()
+test$data <- as.matrix(data[,c(3,4,5,6)])
+test$lable <- data$residential
+pred <- predict(xgmodel, test$data)
+result <- raster(matrix(pred, ncol = landuse@ncols, byrow = TRUE))
+
+# Plot the result
+plot(result, main = "Probability of residential development", 
+     col = rev(brewer.pal(n = 7, name = "RdBu")))
+```
